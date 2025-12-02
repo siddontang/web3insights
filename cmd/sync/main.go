@@ -20,8 +20,17 @@ func main() {
 		date       = flag.String("date", "", "Date to sync (YYYY-MM-DD format, e.g., 2009-01-03)")
 		startDate  = flag.String("start", "", "Start date for date range (YYYY-MM-DD format)")
 		endDate    = flag.String("end", "", "End date for date range (YYYY-MM-DD format, inclusive)")
+		_          = flag.Bool("latest", false, "Sync today's date (uses current date in UTC)")
 	)
 	flag.Parse()
+
+	// Check if -latest flag was explicitly set
+	latestSet := false
+	flag.Visit(func(f *flag.Flag) {
+		if f.Name == "latest" {
+			latestSet = true
+		}
+	})
 
 	// Load configuration
 	var cfg *config.Config
@@ -36,18 +45,25 @@ func main() {
 		os.Exit(1)
 	}
 
-	// Validate flags - date or start/endDate is required
-	if *date == "" && (*startDate == "" || *endDate == "") {
-		fmt.Fprintf(os.Stderr, "Error: must specify either -date or both -start and -end\n")
-		os.Exit(1)
-	}
-	if *date != "" && (*startDate != "" || *endDate != "") {
-		fmt.Fprintf(os.Stderr, "Error: cannot specify both -date and -start/-end\n")
-		os.Exit(1)
-	}
-	if (*startDate != "" && *endDate == "") || (*startDate == "" && *endDate != "") {
-		fmt.Fprintf(os.Stderr, "Error: both -start and -end must be specified for date range\n")
-		os.Exit(1)
+	// Handle -latest flag: use today's date
+	if latestSet {
+		today := time.Now().UTC().Format("2006-01-02")
+		*date = today
+		fmt.Printf("Using today's date: %s\n", today)
+	} else {
+		// Validate flags - date or start/endDate is required (only if -latest is not set)
+		if *date == "" && (*startDate == "" || *endDate == "") {
+			fmt.Fprintf(os.Stderr, "Error: must specify either -date, both -start and -end, or -latest\n")
+			os.Exit(1)
+		}
+		if *date != "" && (*startDate != "" || *endDate != "") {
+			fmt.Fprintf(os.Stderr, "Error: cannot specify both -date and -start/-end\n")
+			os.Exit(1)
+		}
+		if (*startDate != "" && *endDate == "") || (*startDate == "" && *endDate != "") {
+			fmt.Fprintf(os.Stderr, "Error: both -start and -end must be specified for date range\n")
+			os.Exit(1)
+		}
 	}
 
 	// Open database connection
