@@ -18,23 +18,11 @@ import (
 // It downloads both blocks and transactions files to the configured output directory.
 // The date should be in YYYY-MM-DD format (e.g., "2019-01-01").
 // Uses unsigned requests for public bucket access (equivalent to --no-sign-request).
-// It checks if files already exist and skips downloading if they do.
+// It will always check S3 for new files and only download ones that don't exist locally.
 func DownloadBTC(ctx context.Context, cfg *config.Config, date string) error {
 	// Validate date format
 	if len(date) != 10 || date[4] != '-' || date[7] != '-' {
 		return fmt.Errorf("invalid date format, expected YYYY-MM-DD, got: %s", date)
-	}
-
-	// Check if files already exist
-	blocksDir := filepath.Join(cfg.OutDir, "btc", "blocks", date)
-	transactionsDir := filepath.Join(cfg.OutDir, "btc", "transactions", date)
-
-	blocksExist := checkFilesExist(blocksDir)
-	transactionsExist := checkFilesExist(transactionsDir)
-
-	if blocksExist && transactionsExist {
-		fmt.Printf("Files already exist for date %s, skipping download\n", date)
-		return nil
 	}
 
 	// Load AWS config with anonymous credentials for public bucket access
@@ -55,20 +43,16 @@ func DownloadBTC(ctx context.Context, cfg *config.Config, date string) error {
 	// If it doesn't work, we may need to use a custom HTTP client approach.
 	s3Client := s3.NewFromConfig(awsCfg)
 
-	// Download blocks if needed
-	if !blocksExist {
-		blocksPrefix := fmt.Sprintf("%sblocks/date=%s/", cfg.AWSS3BTCPrefix, date)
-		if err := downloadBTCFiles(ctx, s3Client, cfg, blocksPrefix, "blocks", date); err != nil {
-			return fmt.Errorf("failed to download blocks: %w", err)
-		}
+	// Download blocks (idempotent: skips files that already exist locally)
+	blocksPrefix := fmt.Sprintf("%sblocks/date=%s/", cfg.AWSS3BTCPrefix, date)
+	if err := downloadBTCFiles(ctx, s3Client, cfg, blocksPrefix, "blocks", date); err != nil {
+		return fmt.Errorf("failed to download blocks: %w", err)
 	}
 
-	// Download transactions if needed
-	if !transactionsExist {
-		transactionsPrefix := fmt.Sprintf("%stransactions/date=%s/", cfg.AWSS3BTCPrefix, date)
-		if err := downloadBTCFiles(ctx, s3Client, cfg, transactionsPrefix, "transactions", date); err != nil {
-			return fmt.Errorf("failed to download transactions: %w", err)
-		}
+	// Download transactions (idempotent: skips files that already exist locally)
+	transactionsPrefix := fmt.Sprintf("%stransactions/date=%s/", cfg.AWSS3BTCPrefix, date)
+	if err := downloadBTCFiles(ctx, s3Client, cfg, transactionsPrefix, "transactions", date); err != nil {
+		return fmt.Errorf("failed to download transactions: %w", err)
 	}
 
 	return nil
