@@ -73,7 +73,7 @@ export default function Home() {
   const [dailyTransactions, setDailyTransactions] = useState<DailyTransaction[]>([]);
   const [recentBlocks, setRecentBlocks] = useState<RecentBlock[]>([]);
   const [loading, setLoading] = useState(true);
-  const [timeRange, setTimeRange] = useState(30);
+  const [timeRange, setTimeRange] = useState<'1d' | '3d' | '5d' | '7d'>('1d');
 
   useEffect(() => {
     fetchData();
@@ -87,13 +87,13 @@ export default function Home() {
       const statsData = await statsRes.json();
       setStats(statsData);
 
-      // Fetch daily blocks
-      const blocksRes = await fetch(`/api/blocks/daily?days=${timeRange}`);
+      // Fetch blocks data
+      const blocksRes = await fetch(`/api/blocks/daily?range=${timeRange}`);
       const blocksData = await blocksRes.json();
       setDailyBlocks(blocksData);
 
-      // Fetch daily transactions
-      const txRes = await fetch(`/api/transactions/daily?days=${timeRange}`);
+      // Fetch transactions data
+      const txRes = await fetch(`/api/transactions/daily?range=${timeRange}`);
       const txData = await txRes.json();
       setDailyTransactions(txData);
 
@@ -116,6 +116,16 @@ export default function Home() {
     } catch {
       return '';
     }
+  };
+
+  const getTimeRangeLabel = () => {
+    const labels: Record<typeof timeRange, string> = {
+      '1d': '1 day',
+      '3d': '3 days',
+      '5d': '5 days',
+      '7d': '7 days',
+    };
+    return labels[timeRange];
   };
 
   if (loading && !stats) {
@@ -141,17 +151,17 @@ export default function Home() {
               </p>
             </div>
             <div className="flex gap-2">
-              {[7, 30, 90, 365].map((days) => (
+              {(['1d', '3d', '5d', '7d'] as const).map((range) => (
                 <button
-                  key={days}
-                  onClick={() => setTimeRange(days)}
+                  key={range}
+                  onClick={() => setTimeRange(range)}
                   className={`px-4 py-2 rounded-md text-sm font-medium transition-colors ${
-                    timeRange === days
+                    timeRange === range
                       ? 'bg-primary text-primary-foreground'
                       : 'bg-muted hover:bg-muted/80'
                   }`}
                 >
-                  {days}d
+                  {range}
                 </button>
               ))}
             </div>
@@ -189,7 +199,7 @@ export default function Home() {
         <div className="grid grid-cols-1 lg:grid-cols-2 gap-6 mb-8">
           <ChartCard
             title="Blocks per Day"
-            description={`Block production over the last ${timeRange} days`}
+            description={`Block production over the last ${getTimeRangeLabel()}`}
           >
             <ResponsiveContainer width="100%" height={300}>
               <AreaChart data={dailyBlocks}>
@@ -227,7 +237,7 @@ export default function Home() {
 
           <ChartCard
             title="Transactions per Day"
-            description={`Transaction volume over the last ${timeRange} days`}
+            description={`Transaction volume over the last ${getTimeRangeLabel()}`}
           >
             <ResponsiveContainer width="100%" height={300}>
               <BarChart data={dailyTransactions}>
@@ -253,7 +263,7 @@ export default function Home() {
 
           <ChartCard
             title="Transaction Volume"
-            description={`BTC volume over the last ${timeRange} days`}
+            description={`BTC volume over the last ${getTimeRangeLabel()}`}
           >
             <ResponsiveContainer width="100%" height={300}>
               <LineChart data={dailyTransactions}>
@@ -286,7 +296,7 @@ export default function Home() {
 
           <ChartCard
             title="Average Transaction Fees"
-            description={`Fee trends over the last ${timeRange} days`}
+            description={`Fee trends over the last ${getTimeRangeLabel()}`}
           >
             <ResponsiveContainer width="100%" height={300}>
               <AreaChart data={dailyTransactions}>
