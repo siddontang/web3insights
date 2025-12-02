@@ -1,5 +1,3 @@
-import { unstable_cache } from 'next/cache';
-
 /**
  * Cache key generator for date-based queries
  */
@@ -27,21 +25,12 @@ export function isToday(dateString: string | Date): boolean {
 
 /**
  * Create a cached query function for historical data
- * Historical data is cached for 24 hours since it doesn't change
+ * Caching has been disabled; this now just executes the query function.
  */
 export function createCachedQuery<T>(
   queryFn: () => Promise<T[]>,
-  cacheKey: string
+  _cacheKey: string
 ): Promise<T[]> {
-  return unstable_cache(
-    async () => {
-      return queryFn();
-    },
-    [cacheKey],
-    {
-      revalidate: 86400, // 24 hours - historical data doesn't change
-      tags: [cacheKey],
-    }
-  )();
+  return queryFn();
 }
 
