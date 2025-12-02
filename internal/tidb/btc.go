@@ -467,11 +467,13 @@ func insertTransactionsFromFile(db *sql.DB, filePath string, batchSize, inputBat
 		pendingTxs = pendingTxs[:n]
 		pendingInputs, pendingOutputs = collectTransactionData(pendingTxs[:n], pendingInputs, pendingOutputs)
 
+		processedCount := 0
 		if len(pendingTxs) == batchSize {
 			batch := pendingTxs[:batchSize]
 			if err := batchInsertWithStmt(txStmt, batch, extractTransactionArgs); err != nil {
 				return fmt.Errorf("failed to insert transaction batch: %w", err)
 			}
+			processedCount = batchSize
 		}
 
 		inputNum := 0
@@ -493,14 +495,16 @@ func insertTransactionsFromFile(db *sql.DB, filePath string, batchSize, inputBat
 			}
 		}
 
-		totalRows += int64(n)
+		// Only increment totalRows for transactions we actually processed (full batches)
+		if processedCount > 0 {
+			totalRows += int64(processedCount)
+			fmt.Printf("Inserted %d transactions, %d inputs, %d outputs from %s (total rows: %d/%d)\n", processedCount, inputNum, outputNum, filepath.Base(filePath), totalRows, numRows)
 
-		fmt.Printf("Inserted %d transactions, %d inputs, %d outputs from %s (total rows: %d/%d)\n", batchSize, inputNum, outputNum, filepath.Base(filePath), totalRows, numRows)
-
-		// Call progress callback after each batch
-		if onProgress != nil {
-			if err := onProgress(filePath, totalRows, numRows); err != nil {
-				fmt.Fprintf(os.Stderr, "Warning: progress callback failed: %v\n", err)
+			// Call progress callback after each batch
+			if onProgress != nil {
+				if err := onProgress(filePath, totalRows, numRows); err != nil {
+					fmt.Fprintf(os.Stderr, "Warning: progress callback failed: %v\n", err)
+				}
 			}
 		}
 
@@ -514,6 +518,8 @@ func insertTransactionsFromFile(db *sql.DB, filePath string, batchSize, inputBat
 		if err := directInsert(db, txBaseSQL, pendingTxs, extractTransactionArgs, 16); err != nil {
 			return fmt.Errorf("failed to insert remaining transactions: %w", err)
 		}
+		// Only increment if we haven't already processed these transactions
+		// (they were read but not processed in the loop because n < batchSize)
 		totalRows += int64(len(pendingTxs))
 	}
 	if len(pendingInputs) > 0 {
