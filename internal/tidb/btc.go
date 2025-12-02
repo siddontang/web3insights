@@ -68,7 +68,7 @@ func buildValuesSQL(rowCount, placeholderCount int) string {
 // extractArgsFunc is a function type that extracts SQL arguments from an item
 type extractArgsFunc[T any] func(T) []interface{}
 
-// batchInsertWithStmt executes a batch insert using a prepared statement
+// batchInsertWithStmt executes a batch insert using a prepared statement with retry
 func batchInsertWithStmt[T any](stmt *sql.Stmt, items []T, extractArgs extractArgsFunc[T]) error {
 	if len(items) == 0 {
 		return nil
@@ -79,14 +79,16 @@ func batchInsertWithStmt[T any](stmt *sql.Stmt, items []T, extractArgs extractAr
 		args = append(args, extractArgs(item)...)
 	}
 
-	_, err := stmt.Exec(args...)
-	if err != nil {
-		return fmt.Errorf("failed to execute batch insert: %w", err)
-	}
-	return nil
+	return retryWithBackoffNoReturn(func() error {
+		_, err := stmt.Exec(args...)
+		if err != nil {
+			return fmt.Errorf("failed to execute batch insert: %w", err)
+		}
+		return nil
+	}, "batch insert")
 }
 
-// directInsert executes a direct SQL insert (not using prepared statement)
+// directInsert executes a direct SQL insert (not using prepared statement) with retry
 func directInsert[T any](db *sql.DB, baseSQL string, items []T, extractArgs extractArgsFunc[T], placeholderCount int) error {
 	if len(items) == 0 {
 		return nil
@@ -100,21 +102,49 @@ func directInsert[T any](db *sql.DB, baseSQL string, items []T, extractArgs extr
 		args = append(args, extractArgs(item)...)
 	}
 
-	_, err := db.Exec(sql, args...)
-	if err != nil {
-		return fmt.Errorf("failed to execute direct insert: %w", err)
-	}
-	return nil
+	return retryWithBackoffNoReturn(func() error {
+		_, err := db.Exec(sql, args...)
+		if err != nil {
+			return fmt.Errorf("failed to execute direct insert: %w", err)
+		}
+		return nil
+	}, "direct insert")
 }
+
+// ProgressCallback is called periodically during file processing to allow status updates
+// filePath: path to the file being processed
+// row: number of rows processed so far in this file
+// numRows: total number of rows in the file
+type ProgressCallback func(filePath string, row int64, numRows int64) error
 
 // LoadBtcBlocks reads a block parquet file and inserts into btc_blocks table
 func LoadBtcBlocks(db *sql.DB, filePath string, cfg *config.Config) error {
-	return insertBlocksFromFile(db, filePath, cfg.BlockBatchSize)
+	return LoadBtcBlocksWithProgress(db, filePath, cfg, nil)
+}
+
+// LoadBtcBlocksWithProgress reads a block parquet file and inserts into btc_blocks table with progress callback
+func LoadBtcBlocksWithProgress(db *sql.DB, filePath string, cfg *config.Config, onProgress ProgressCallback) error {
+	return LoadBtcBlocksWithProgressAndRow(db, filePath, cfg, onProgress, 0)
+}
+
+// LoadBtcBlocksWithProgressAndRow reads a block parquet file and inserts with row
+func LoadBtcBlocksWithProgressAndRow(db *sql.DB, filePath string, cfg *config.Config, onProgress ProgressCallback, startRow int64) error {
+	return insertBlocksFromFile(db, filePath, cfg.BlockBatchSize, onProgress, startRow)
 }
 
 // LoadBtcTransactions reads a transaction parquet file and inserts into btc_transactions, btc_transaction_inputs, and btc_transaction_outputs tables
 func LoadBtcTransactions(db *sql.DB, filePath string, cfg *config.Config) error {
-	return insertTransactionsFromFile(db, filePath, cfg.TransactionBatchSize, cfg.InputBatchSize, cfg.OutputBatchSize)
+	return LoadBtcTransactionsWithProgress(db, filePath, cfg, nil)
+}
+
+// LoadBtcTransactionsWithProgress reads a transaction parquet file and inserts with progress callback
+func LoadBtcTransactionsWithProgress(db *sql.DB, filePath string, cfg *config.Config, onProgress ProgressCallback) error {
+	return LoadBtcTransactionsWithProgressAndRow(db, filePath, cfg, onProgress, 0)
+}
+
+// LoadBtcTransactionsWithProgressAndRow reads a transaction parquet file and inserts with row
+func LoadBtcTransactionsWithProgressAndRow(db *sql.DB, filePath string, cfg *config.Config, onProgress ProgressCallback, startRow int64) error {
+	return insertTransactionsFromFile(db, filePath, cfg.TransactionBatchSize, cfg.InputBatchSize, cfg.OutputBatchSize, onProgress, startRow)
 }
 
 // extractBlockArgs extracts SQL arguments from a BtcBlock
@@ -234,15 +264,37 @@ func extractOutputArgs(output outputRow) []interface{} {
 }
 
 // insertBlocksFromFile reads a block parquet file and inserts into btc_blocks table
-func insertBlocksFromFile(db *sql.DB, filePath string, batchSize int) error {
+func insertBlocksFromFile(db *sql.DB, filePath string, batchSize int, onProgress ProgressCallback, startRow int64) error {
 	file, err := os.Open(filePath)
 	if err != nil {
 		return fmt.Errorf("failed to open file %s: %w", filePath, err)
 	}
 	defer file.Close()
 
-	reader := parquet.NewGenericReader[chain.BtcBlock](file)
+	fileInfo, err := file.Stat()
+	if err != nil {
+		return fmt.Errorf("failed to get file info: %w", err)
+	}
+
+	parquetFile, err := parquet.OpenFile(file, fileInfo.Size())
+	if err != nil {
+		return fmt.Errorf("failed to open parquet file: %w", err)
+	}
+
+	schema := parquet.SchemaOf(chain.BtcBlock{})
+	reader := parquet.NewGenericReader[chain.BtcBlock](parquetFile, schema)
 	defer reader.Close()
+
+	// Get total number of rows in the file
+	numRows := parquetFile.NumRows()
+
+	// Seek to start row if resuming
+	if startRow > 0 {
+		if err := reader.SeekToRow(startRow); err != nil {
+			return fmt.Errorf("failed to seek to row %d: %w", startRow, err)
+		}
+		fmt.Printf("Resuming from row %d/%d in %s\n", startRow, numRows, filepath.Base(filePath))
+	}
 
 	baseSQL := "INSERT IGNORE INTO btc_blocks (" +
 		"record_date, hash, size, stripped_size, weight, number, version, merkle_root," +
@@ -254,13 +306,17 @@ func insertBlocksFromFile(db *sql.DB, filePath string, batchSize int) error {
 	valuesSQL := buildValuesSQL(batchSize, 17)
 	batchSQL := baseSQL + valuesSQL
 
-	stmt, err := db.Prepare(batchSQL)
+	stmt, err := retryWithBackoff(func() (*sql.Stmt, error) {
+		return db.Prepare(batchSQL)
+	}, "prepare block statement")
 	if err != nil {
 		return fmt.Errorf("failed to prepare statement: %w", err)
 	}
 	defer stmt.Close()
 
 	pendingBlocks := make([]chain.BtcBlock, 0, batchSize)
+
+	var totalRows int64 = startRow
 
 	for {
 		n, err := reader.Read(pendingBlocks[:batchSize])
@@ -281,7 +337,16 @@ func insertBlocksFromFile(db *sql.DB, filePath string, batchSize int) error {
 			return fmt.Errorf("failed to insert block batch: %w", err)
 		}
 
-		fmt.Printf("Inserted %d blocks from %s\n", len(batch), filepath.Base(filePath))
+		totalRows += int64(len(batch))
+
+		fmt.Printf("Inserted %d blocks from %s (total: %d/%d)\n", len(batch), filepath.Base(filePath), totalRows, numRows)
+
+		// Call progress callback after each batch
+		if onProgress != nil {
+			if err := onProgress(filePath, totalRows, numRows); err != nil {
+				fmt.Fprintf(os.Stderr, "Warning: progress callback failed: %v\n", err)
+			}
+		}
 	}
 
 	// Process remaining blocks with direct SQL
@@ -289,22 +354,52 @@ func insertBlocksFromFile(db *sql.DB, filePath string, batchSize int) error {
 		if err := directInsert(db, baseSQL, pendingBlocks, extractBlockArgs, 17); err != nil {
 			return fmt.Errorf("failed to insert remaining blocks: %w", err)
 		}
-		fmt.Printf("Inserted %d remaining blocks from %s\n", len(pendingBlocks), filepath.Base(filePath))
+		totalRows += int64(len(pendingBlocks))
+		fmt.Printf("Inserted %d remaining blocks from %s (total: %d/%d)\n", len(pendingBlocks), filepath.Base(filePath), totalRows, numRows)
+
+		// Call progress callback after remaining blocks (always save at end)
+		if onProgress != nil {
+			if err := onProgress(filePath, totalRows, numRows); err != nil {
+				fmt.Fprintf(os.Stderr, "Warning: progress callback failed: %v\n", err)
+			}
+		}
 	}
 
 	return nil
 }
 
 // insertTransactionsFromFile reads a transaction parquet file and inserts into btc_transactions, btc_transaction_inputs, and btc_transaction_outputs tables
-func insertTransactionsFromFile(db *sql.DB, filePath string, batchSize, inputBatchSize, outputBatchSize int) error {
+func insertTransactionsFromFile(db *sql.DB, filePath string, batchSize, inputBatchSize, outputBatchSize int, onProgress ProgressCallback, startRow int64) error {
 	file, err := os.Open(filePath)
 	if err != nil {
 		return fmt.Errorf("failed to open file %s: %w", filePath, err)
 	}
 	defer file.Close()
 
-	reader := parquet.NewGenericReader[chain.BtcTransaction](file)
+	fileInfo, err := file.Stat()
+	if err != nil {
+		return fmt.Errorf("failed to get file info: %w", err)
+	}
+
+	parquetFile, err := parquet.OpenFile(file, fileInfo.Size())
+	if err != nil {
+		return fmt.Errorf("failed to open parquet file: %w", err)
+	}
+
+	schema := parquet.SchemaOf(chain.BtcTransaction{})
+	reader := parquet.NewGenericReader[chain.BtcTransaction](parquetFile, schema)
 	defer reader.Close()
+
+	// Get total number of rows in the file
+	numRows := parquetFile.NumRows()
+
+	// Seek to start row if resuming
+	if startRow > 0 {
+		if err := reader.SeekToRow(startRow); err != nil {
+			return fmt.Errorf("failed to seek to row %d: %w", startRow, err)
+		}
+		fmt.Printf("Resuming from row %d/%d in %s\n", startRow, numRows, filepath.Base(filePath))
+	}
 
 	// Prepare transaction statement once for reuse
 	txBaseSQL := "INSERT IGNORE INTO btc_transactions (" +
@@ -316,7 +411,9 @@ func insertTransactionsFromFile(db *sql.DB, filePath string, batchSize, inputBat
 	txValuesSQL := buildValuesSQL(batchSize, 16)
 	txBatchSQL := txBaseSQL + txValuesSQL
 
-	txStmt, err := db.Prepare(txBatchSQL)
+	txStmt, err := retryWithBackoff(func() (*sql.Stmt, error) {
+		return db.Prepare(txBatchSQL)
+	}, "prepare transaction statement")
 	if err != nil {
 		return fmt.Errorf("failed to prepare transaction statement: %w", err)
 	}
@@ -336,7 +433,9 @@ func insertTransactionsFromFile(db *sql.DB, filePath string, batchSize, inputBat
 	// Prepare statements for input/output batch sizes
 	inputValuesSQL := buildValuesSQL(inputBatchSize, 12)
 	inputBatchSQL := inputBaseSQL + inputValuesSQL
-	inputStmt, err := db.Prepare(inputBatchSQL)
+	inputStmt, err := retryWithBackoff(func() (*sql.Stmt, error) {
+		return db.Prepare(inputBatchSQL)
+	}, "prepare input statement")
 	if err != nil {
 		return fmt.Errorf("failed to prepare input statement: %w", err)
 	}
@@ -344,7 +443,9 @@ func insertTransactionsFromFile(db *sql.DB, filePath string, batchSize, inputBat
 
 	outputValuesSQL := buildValuesSQL(outputBatchSize, 9)
 	outputBatchSQL := outputBaseSQL + outputValuesSQL
-	outputStmt, err := db.Prepare(outputBatchSQL)
+	outputStmt, err := retryWithBackoff(func() (*sql.Stmt, error) {
+		return db.Prepare(outputBatchSQL)
+	}, "prepare output statement")
 	if err != nil {
 		return fmt.Errorf("failed to prepare output statement: %w", err)
 	}
@@ -354,6 +455,8 @@ func insertTransactionsFromFile(db *sql.DB, filePath string, batchSize, inputBat
 
 	pendingInputs := make([]inputRow, 0, inputBatchSize)
 	pendingOutputs := make([]outputRow, 0, outputBatchSize)
+
+	var totalRows int64 = startRow
 
 	for {
 		n, err := reader.Read(pendingTxs[:batchSize])
@@ -389,7 +492,17 @@ func insertTransactionsFromFile(db *sql.DB, filePath string, batchSize, inputBat
 				return fmt.Errorf("failed to insert output batch: %w", err)
 			}
 		}
-		fmt.Printf("Inserted %d transactions, %d inputs, %d outputs from %s\n", batchSize, inputNum, outputNum, filepath.Base(filePath))
+
+		totalRows += int64(n)
+
+		fmt.Printf("Inserted %d transactions, %d inputs, %d outputs from %s (total rows: %d/%d)\n", batchSize, inputNum, outputNum, filepath.Base(filePath), totalRows, numRows)
+
+		// Call progress callback after each batch
+		if onProgress != nil {
+			if err := onProgress(filePath, totalRows, numRows); err != nil {
+				fmt.Fprintf(os.Stderr, "Warning: progress callback failed: %v\n", err)
+			}
+		}
 
 		if n < batchSize || err == io.EOF {
 			break
@@ -401,6 +514,7 @@ func insertTransactionsFromFile(db *sql.DB, filePath string, batchSize, inputBat
 		if err := directInsert(db, txBaseSQL, pendingTxs, extractTransactionArgs, 16); err != nil {
 			return fmt.Errorf("failed to insert remaining transactions: %w", err)
 		}
+		totalRows += int64(len(pendingTxs))
 	}
 	if len(pendingInputs) > 0 {
 		if err := directInsert(db, inputBaseSQL, pendingInputs, extractInputArgs, 12); err != nil {
@@ -412,7 +526,16 @@ func insertTransactionsFromFile(db *sql.DB, filePath string, batchSize, inputBat
 			return fmt.Errorf("failed to insert remaining outputs: %w", err)
 		}
 	}
-	fmt.Printf("Inserted remaining %d transactions, %d inputs, %d outputs from %s\n", len(pendingTxs), len(pendingInputs), len(pendingOutputs), filepath.Base(filePath))
+	if len(pendingTxs) > 0 || len(pendingInputs) > 0 || len(pendingOutputs) > 0 {
+		fmt.Printf("Inserted remaining %d transactions, %d inputs, %d outputs from %s (total rows: %d/%d)\n", len(pendingTxs), len(pendingInputs), len(pendingOutputs), filepath.Base(filePath), totalRows, numRows)
+	}
+
+	// Call progress callback after remaining items (always save at end)
+	if onProgress != nil {
+		if err := onProgress(filePath, totalRows, numRows); err != nil {
+			fmt.Fprintf(os.Stderr, "Warning: progress callback failed: %v\n", err)
+		}
+	}
 
 	return nil
 }
