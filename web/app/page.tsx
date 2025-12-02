@@ -7,6 +7,8 @@ import {
   TrendingUp,
   Activity,
   ArrowUpRight,
+  ExternalLink,
+  Cloud,
 } from 'lucide-react';
 import StatCard from '@/components/StatCard';
 import ChartCard from '@/components/ChartCard';
@@ -150,20 +152,32 @@ export default function Home() {
                 Bitcoin Blockchain Analytics
               </p>
             </div>
-            <div className="flex gap-2">
-              {(['1d', '3d', '5d', '7d'] as const).map((range) => (
-                <button
-                  key={range}
-                  onClick={() => setTimeRange(range)}
-                  className={`px-4 py-2 rounded-md text-sm font-medium transition-colors ${
-                    timeRange === range
-                      ? 'bg-primary text-primary-foreground'
-                      : 'bg-muted hover:bg-muted/80'
-                  }`}
-                >
-                  {range}
-                </button>
-              ))}
+            <div className="flex items-center gap-3">
+              <div className="flex gap-2">
+                {(['1d', '3d', '5d', '7d'] as const).map((range) => (
+                  <button
+                    key={range}
+                    onClick={() => setTimeRange(range)}
+                    className={`px-4 py-2 rounded-md text-sm font-medium transition-colors ${
+                      timeRange === range
+                        ? 'bg-primary text-primary-foreground'
+                        : 'bg-muted hover:bg-muted/80'
+                    }`}
+                  >
+                    {range}
+                  </button>
+                ))}
+              </div>
+              <a
+                href="https://tidbcloud.com/free-trial/?utm_source=sales_bdm&utm_medium=sales&utm_content=Siddon"
+                target="_blank"
+                rel="noopener noreferrer"
+                className="flex items-center gap-2 px-4 py-2 bg-primary text-primary-foreground rounded-md text-sm font-medium hover:bg-primary/90 transition-colors shadow-sm"
+              >
+                <Cloud className="h-4 w-4" />
+                Start TiDB Cloud
+                <ExternalLink className="h-3 w-3" />
+              </a>
             </div>
           </div>
         </div>
